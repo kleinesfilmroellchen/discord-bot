@@ -4,7 +4,15 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
-import { ChatInputCommandInteraction, SlashCommandBuilder, TextChannel } from "discord.js";
+import {
+    ApplicationCommandData,
+    ChatInputCommandInteraction,
+    SlashCommandBuilder,
+    TextChannel,
+    TextBasedChannel,
+    Emoji,
+    SlashCommandStringOption,
+} from "discord.js";
 import githubAPI, { Repository, SERENITY_REPOSITORY } from "../apis/githubAPI";
 import { embedFromIssueOrPull } from "../util/embedFromIssueOrPull";
 import { getSadCaret } from "../util/emoji";
@@ -46,6 +54,62 @@ const repositories: Array<{
     },
 ];
 
+function repositoryOption(repository: SlashCommandStringOption): SlashCommandStringOption {
+    return repository
+        .setName("repository")
+        .setDescription("The repository to query in")
+        .setChoices(...Object.values(repositories).map(({ name }) => ({ name, value: name })));
+}
+
+const prNumberPattern = /[1-9]\d*/gi;
+
+async function findRepositoryByNameOrChannel(
+    repositoryName: string | null,
+    channel: TextBasedChannel | null
+): Promise<Repository> {
+    let repository: Repository | undefined;
+
+    // If a repository name was provided explicitly, find the repository associated with it
+    if (repositoryName !== null) {
+        repository = repositories.find(
+            repository => repository.name === repositoryName
+        )?.repository;
+    }
+
+    // If no repository name was provided, try to use the channel to infer a repository
+    if (repository === undefined) {
+        const channelId = channel?.id;
+
+        if (channelId) {
+            const findByChannelId = repositories.find(repository =>
+                repository.defaultChannels?.includes(channelId)
+            );
+
+            if (findByChannelId) repository = findByChannelId.repository;
+        }
+    }
+
+    // If the repository could not be inferred by channel, try to infer by category
+    if (repository === undefined) {
+        const categoryId = await channel
+            ?.fetch()
+            .then(channel => (channel instanceof TextChannel ? channel.parentId : undefined));
+
+        if (categoryId) {
+            const findByCategoryId = repositories.find(repository =>
+                repository.defaultCategories?.includes(categoryId)
+            );
+
+            if (findByCategoryId) repository = findByCategoryId.repository;
+        }
+    }
+
+    // Fall back to the serenity repository
+    repository ??= SERENITY_REPOSITORY;
+
+    return repository;
+}
+
 export class GithubCommand extends Command {
     override data() {
         const aliases = ["github", "issue", "pull"];
@@ -64,14 +128,7 @@ export class GithubCommand extends Command {
             .addStringOption(url =>
                 url.setName("url").setDescription("The full url to an issue or pull request")
             )
-            .addStringOption(repository =>
-                repository
-                    .setName("repository")
-                    .setDescription("The repository to query in")
-                    .setChoices(
-                        ...Object.values(repositories).map(({ name }) => ({ name, value: name }))
-                    )
-            );
+            .addStringOption(repositoryOption);
 
         return aliases.map(name => baseCommand.setName(name).toJSON());
     }
@@ -101,45 +158,7 @@ export class GithubCommand extends Command {
             }
         }
 
-        let repository: Repository | undefined;
-
-        // If a repository name was provided explicitly, find the repository associated with it
-        if (repositoryName !== null) {
-            repository = repositories.find(
-                repository => repository.name === repositoryName
-            )?.repository;
-        }
-
-        // If no repository name was provided, try to use the channel to infer a repository
-        if (repository === undefined) {
-            const channelId = interaction.channel?.id;
-
-            if (channelId) {
-                const findByChannelId = repositories.find(repository =>
-                    repository.defaultChannels?.includes(channelId)
-                );
-
-                if (findByChannelId) repository = findByChannelId.repository;
-            }
-        }
-
-        // If the repository could not be inferred by channel, try to infer by category
-        if (repository === undefined) {
-            const categoryId = await interaction.channel
-                ?.fetch()
-                .then(channel => (channel instanceof TextChannel ? channel.parentId : undefined));
-
-            if (categoryId) {
-                const findByCategoryId = repositories.find(repository =>
-                    repository.defaultCategories?.includes(categoryId)
-                );
-
-                if (findByCategoryId) repository = findByCategoryId.repository;
-            }
-        }
-
-        // Fall back to the serenity repository
-        repository ??= SERENITY_REPOSITORY;
+        const repository = await findRepositoryByNameOrChannel(repositoryName, interaction.channel);
 
         if (number !== null) {
             const result = await embedFromIssueOrPull(
@@ -164,6 +183,82 @@ export class GithubCommand extends Command {
         }
 
         const sadcaret = await getSadCaret(interaction);
+        await interaction.reply({
+            content: `No matching issues or pull requests found ${sadcaret ?? ":^("}`,
+            ephemeral: true,
+        });
+    }
+}
+
+export class ReviewList extends Command {
+    override data(): ApplicationCommandData[] {
+        const aliases = ["reviewlist", "prlist"];
+
+        const baseCommand = new SlashCommandBuilder()
+            .setDescription("Link several pull requests for review")
+            .addStringOption(numbers =>
+                numbers
+                    .setName("numbers")
+                    .setDescription(
+                        "The pull request numbers separated by any non-number characters"
+                    )
+            )
+            .addStringOption(repositoryOption);
+
+        return aliases.map(name => baseCommand.setName(name).toJSON());
+    }
+
+    override async handleCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+        const repositoryName = interaction.options.getString("repository");
+        const unparsedNumbers = interaction.options.getString("numbers");
+
+        const repository = await findRepositoryByNameOrChannel(repositoryName, interaction.channel);
+
+        async function descriptionLineForPull(pullNumber: number): Promise<string | undefined> {
+            const pull = await githubAPI.getPull(pullNumber, repository);
+            if (pull === undefined) return undefined;
+
+            // Angle brackets prevent Discord from creating cards automatically.
+            return `<${pull.html_url}> (${pull.title}) [+${pull.additions}/-${pull.deletions}]`;
+        }
+
+        let sadcaret: Emoji | null = null;
+
+        if (unparsedNumbers !== null) {
+            // Since the pattern matches a subset of JavaScript numbers, the array will never contain NaNs.
+            const numbers: Array<number> = [...unparsedNumbers.matchAll(prNumberPattern)].map(
+                value => parseInt(value[0])
+            );
+
+            const descriptions = await Promise.all(
+                numbers.map(async number => ({
+                    number: number,
+                    description: await descriptionLineForPull(number),
+                }))
+            );
+            const failedDescriptions = descriptions.filter(
+                ({ description }) => description === undefined
+            );
+            if (failedDescriptions.length !== 0) {
+                sadcaret ??= await getSadCaret(interaction);
+                await interaction.reply({
+                    content: `No matching issues or pull requests found for the numbers ${failedDescriptions
+                        .map(({ number }) => number)
+                        .join(", ")} ${sadcaret ?? ":^("} `,
+                    ephemeral: true,
+                });
+                return;
+            }
+
+            const descriptionList = descriptions.map(({ description }) => description).join("\n");
+
+            await interaction.reply({
+                content: descriptionList,
+            });
+            return;
+        }
+
+        sadcaret ??= await getSadCaret(interaction);
         await interaction.reply({
             content: `No matching issues or pull requests found ${sadcaret ?? ":^("}`,
             ephemeral: true,
